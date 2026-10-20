@@ -1,0 +1,57 @@
+#!/bin/bash
+# Slipper: the app's executable. It opens this app's launcher in Terminal.
+#
+# Terminal runs a .command file by typing its path into an interactive shell, and this app's
+# path can hold any character. So Terminal is never given that path. Each launch writes a
+# one-time shim at a plain path (ASCII letters, digits and . _ / - only) holding the
+# launcher's path quoted by this script; Terminal opens the shim, which deletes itself and
+# runs the launcher.
+unset CDPATH
+APP_ID=__APP_ID__
+
+# fail <detail for Terminal> [message for the alert]
+fail() {
+    local alert="Its Slipper launcher could not be prepared. Run the app's Contents/MacOS executable from Terminal to see why."
+    if [ $# -ge 2 ]; then alert=$2; fi
+    printf 'slipper: %s\n' "$1" >&2
+    osascript -e 'on run argv' \
+        -e 'display alert "This app could not start" message (item 1 of argv)' \
+        -e 'end run' "$alert" >/dev/null 2>&1
+    exit 1
+}
+
+# Spelled out rather than as ranges, so the check means the same in every locale.
+plain() {
+    case $1 in
+        *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/-]*) return 1 ;;
+    esac
+}
+
+case $0 in */*) dir=${0%/*} ;; *) dir=. ;; esac
+resources=$(cd -P -- "$dir/../Resources" && pwd -P && echo .) || fail "can't find the app's Resources folder"
+resources=${resources%??}
+launcher="$resources/launcher.command"
+[ -f "$launcher" ] || fail "missing $launcher"
+
+case $APP_ID in '' | *[!abcdefghijklmnopqrstuvwxyz0123456789-]*) fail "invalid app ID: $APP_ID" ;; esac
+shims="$HOME/Library/Caches/Slipper"
+plain "$shims" || fail "the home folder's path has characters that can't be handed to Terminal safely: $HOME" \
+    "Slipper apps can't open when the home folder's path has spaces or other unusual characters ($HOME)."
+
+umask 077
+mkdir -p -- "$shims" || fail "can't create $shims"
+launch_dir=$(mktemp -d "$shims/$APP_ID.XXXXXXXX") || fail "can't write in $shims"
+shim="$launch_dir/launch.command"
+plain "$shim" || fail "unexpected shim path: $shim"
+q=\'
+if ! {
+    printf '#!/bin/bash\n'
+    printf '# Slipper: runs one app'\''s launcher once. Each launch writes a new one.\n'
+    printf '%s\n' 'rm -f -- "$0" && rmdir -- "${0%/*}"'
+    printf 'exec /bin/bash %s\n' "'${launcher//$q/$q\\$q$q}'"
+} > "$shim" || ! chmod 700 "$shim"; then
+    rm -f -- "$shim"
+    rmdir -- "$launch_dir"
+    fail "can't write $shim"
+fi
+exec open -a Terminal "$shim"

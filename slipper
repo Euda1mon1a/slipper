@@ -1,0 +1,385 @@
+#!/bin/bash
+# Slipper: turn a local web app into a Mac app you keep in the Dock.
+#
+# Opening the app runs its launcher in Terminal. The launcher starts the server, waits for it
+# to answer, opens the browser, and stops the server when the Terminal window closes. The app
+# holds everything: Contents/MacOS/<name> and Contents/Resources/launcher.command are fixed
+# code copied from templates/, and Contents/Resources/slipper.conf holds this app's settings,
+# shell-quoted.
+set -eu
+unset CDPATH
+
+VERSION=0.1.0
+MARKER_KEY=SlipperVersion # Info.plist key marking an app Slipper made (it may replace those)
+ID_KEY=SlipperID          # Info.plist key holding the app's random ID
+
+die() {
+    printf 'slipper: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage: slipper --name NAME --port PORT --start-cmd CMD [options]
+
+Creates NAME.app. Opening it runs CMD in Terminal, waits for the server to answer,
+opens the browser, and stops the server when the Terminal window closes.
+
+Required:
+  --name NAME          App name shown in Finder and the Dock
+  --port PORT          Port the server listens on (1-65535)
+  --start-cmd CMD      Shell command that starts the server (run with /bin/zsh)
+
+Options:
+  --icon IMAGE         Square image for the app icon (1024x1024 PNG is best)
+  --output PATH        Where to create the app (default: ~/Desktop/NAME.app);
+                       an existing folder puts NAME.app inside it
+  --workdir DIR        Folder the commands run in (default: your home folder)
+  --venv DIR           Python virtual environment to activate first
+  --install-cmd CMD    Command to run on the first launch (and again if it changes)
+  --url URL            Page to open (default: http://localhost:PORT)
+  --wait SECONDS       How long to wait for the server to answer (default: 30)
+  --force              Replace an existing app that Slipper did not create;
+                       the old one is kept beside it, renamed
+  --version            Print the version
+  -h, --help           Show this help
+EOF
+}
+
+# Single-quote a value for the shell, byte for byte: ' becomes '\''.
+shell_quote() {
+    local q=\'
+    printf "'%s'" "${1//$q/$q\\$q$q}"
+}
+
+# Set PHYS to the physical path of folder $1, keeping any trailing newlines in its name.
+physical() {
+    local out
+    out=$(cd -P -- "$1" && pwd -P && echo .) || return 1
+    PHYS=${out%??}
+}
+
+plist_raw() {
+    plutil -extract "$2" raw -o - "$1/Contents/Info.plist" 2>/dev/null
+}
+
+is_ours() {
+    plist_raw "$1" "$MARKER_KEY" >/dev/null
+}
+
+NAME="" ICON="" PORT="" START_CMD="" OUTPUT="" VENV="" URL="" INSTALL_CMD="" WORKDIR=""
+WAIT=30 FORCE=""
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        --name | --icon | --port | --start-cmd | --output | --venv | --url | --install-cmd | --workdir | --wait)
+            [ $# -ge 2 ] || die "$1 needs a value"
+            case $1 in
+                --name) NAME=$2 ;;
+                --icon) ICON=$2 ;;
+                --port) PORT=$2 ;;
+                --start-cmd) START_CMD=$2 ;;
+                --output) OUTPUT=$2 ;;
+                --venv) VENV=$2 ;;
+                --url) URL=$2 ;;
+                --install-cmd) INSTALL_CMD=$2 ;;
+                --workdir) WORKDIR=$2 ;;
+                --wait) WAIT=$2 ;;
+            esac
+            shift 2
+            ;;
+        --force) FORCE=1; shift ;;
+        --version) echo "slipper $VERSION"; exit 0 ;;
+        -h | --help) usage; exit 0 ;;
+        *) die "unknown option: $1 (see --help)" ;;
+    esac
+done
+
+# plutil's raw output format, used to recognise Slipper's apps, arrived in macOS 12.
+major=$(sw_vers -productVersion 2>/dev/null | cut -d. -f1)
+case $major in
+    '' | *[!0-9]*) ;;
+    *) [ "$major" -ge 12 ] || die "Slipper needs macOS 12 (Monterey) or later" ;;
+esac
+
+# --- Check the inputs ------------------------------------------------------------------
+
+[ -n "$NAME" ] || die "--name is required (see --help)"
+[ -n "$PORT" ] || die "--port is required"
+[ -n "$START_CMD" ] || die "--start-cmd is required"
+
+case $NAME in *[[:cntrl:]]*) die "--name can't contain control characters" ;; esac
+printf '%s' "$NAME" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 || die "--name must be valid UTF-8 text"
+case $NAME in
+    *[ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789]*) ;;
+    *) die "--name needs at least one ASCII letter or digit" ;;
+esac
+
+case $PORT in '' | *[!0-9]*) die "--port must be a number from 1 to 65535" ;; esac
+[ ${#PORT} -le 5 ] || die "--port must be a number from 1 to 65535"
+PORT=$((10#$PORT))
+[ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "--port must be a number from 1 to 65535"
+
+case $WAIT in '' | *[!0-9]*) die "--wait must be a whole number of seconds" ;; esac
+[ ${#WAIT} -le 4 ] || die "--wait must be 3600 seconds or less"
+WAIT=$((10#$WAIT))
+[ "$WAIT" -ge 1 ] && [ "$WAIT" -le 3600 ] || die "--wait must be from 1 to 3600 seconds"
+
+[ -n "$URL" ] || URL="http://localhost:$PORT"
+case $URL in http://?* | https://?*) ;; *) die "--url must start with http:// or https://" ;; esac
+case $URL in *[[:space:][:cntrl:]]*) die "--url can't contain spaces or control characters" ;; esac
+printf '%s' "$URL" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 || die "--url must be valid UTF-8 text"
+
+if [ -n "$ICON" ]; then
+    [ -f "$ICON" ] || die "icon not found: $ICON"
+    case $ICON in /*) ;; *) ICON="$PWD/$ICON" ;; esac
+fi
+
+if [ -n "$WORKDIR" ]; then
+    [ -d "$WORKDIR" ] || die "--workdir is not a folder: $WORKDIR"
+    physical "$WORKDIR" || die "can't open --workdir $WORKDIR"
+    WORKDIR=$PHYS
+fi
+
+if [ -n "$VENV" ]; then
+    case $VENV in /*) ;; *) VENV="$PWD/$VENV" ;; esac
+    [ -f "$VENV/bin/activate" ] ||
+        printf 'slipper: note: %s has no bin/activate yet; the launcher skips it until it does\n' "$VENV" >&2
+fi
+
+# Executable name: ASCII letters, digits and underscores. File name: the name as typed,
+# minus the characters a file name can't hold.
+EXEC_NAME=$(printf '%s' "$NAME" | LC_ALL=C tr ' ' '_' | LC_ALL=C tr -cd 'A-Za-z0-9_' | LC_ALL=C cut -c1-64)
+FILE_NAME=$(printf '%s' "$NAME" | LC_ALL=C tr '/:' '--' | LC_ALL=C sed 's/^\.*//')
+[ -n "$FILE_NAME" ] || FILE_NAME=$EXEC_NAME
+[ "$(printf '%s' "$FILE_NAME" | LC_ALL=C wc -c)" -le 200 ] || die "--name is too long for a file name"
+
+[ -n "$OUTPUT" ] || OUTPUT="$HOME/Desktop/$FILE_NAME.app"
+case $OUTPUT in
+    *.app | *.app/) ;;
+    *) if [ -d "$OUTPUT" ]; then OUTPUT="${OUTPUT%/}/$FILE_NAME.app"; fi ;;
+esac
+OUTPUT=${OUTPUT%/}
+case $OUTPUT in *.app) ;; *) die "--output must be a folder or a path ending in .app" ;; esac
+case $OUTPUT in
+    */*) PARENT=${OUTPUT%/*} APP_FILE=${OUTPUT##*/} ;;
+    *) PARENT=. APP_FILE=$OUTPUT ;;
+esac
+[ -n "$PARENT" ] || PARENT=/
+[ "$APP_FILE" != .app ] || die "--output needs a name before .app"
+[ -d "$PARENT" ] || die "folder not found: $PARENT"
+physical "$PARENT" || die "can't open $PARENT"
+PARENT=$PHYS
+case $PARENT in /) OUTPUT="/$APP_FILE" ;; *) OUTPUT="$PARENT/$APP_FILE" ;; esac
+
+STAGE="" OLD="" CREATED="" DONE="" REPLACE="" LOCKED=""
+
+# On any exit: if the new app never landed, put the previous one back; then remove the
+# staging folder (which holds the previous app when Slipper made it) and the lock.
+cleanup() {
+    trap '' INT TERM HUP
+    local keep_stage=""
+    # $OUTPUT/Contents present means the new app landed even if DONE wasn't set yet.
+    if [ -n "$OLD" ] && [ -z "$DONE" ] && [ -e "$OLD" ] && [ ! -e "$OUTPUT/Contents" ]; then
+        if [ -n "$CREATED" ]; then rmdir -- "$OUTPUT" 2>/dev/null || true; fi
+        if [ ! -e "$OUTPUT" ] && [ ! -L "$OUTPUT" ] && mv -- "$OLD" "$OUTPUT" 2>/dev/null; then
+            printf 'slipper: put the previous app back at %s\n' "$OUTPUT" >&2
+        elif [ "$REPLACE" = ours ]; then
+            # Something else took the target meanwhile. Keep the previous app in plain sight
+            # beside it rather than inside the hidden staging folder.
+            local kept n=1
+            kept="$OUTPUT.previous-$(date +%Y%m%d-%H%M%S)"
+            while [ -e "$kept" ] || [ -L "$kept" ]; do
+                n=$((n + 1))
+                kept="$OUTPUT.previous-$(date +%Y%m%d-%H%M%S)-$n"
+            done
+            if mv -- "$OLD" "$kept" 2>/dev/null; then
+                printf 'slipper: could not put the previous app back; kept it as %s\n' "$kept" >&2
+            else
+                printf 'slipper: could not put the previous app back; it is at %s\n' "$OLD" >&2
+                keep_stage=1
+            fi
+        else
+            printf 'slipper: could not put the previous app back; it is at %s\n' "$OLD" >&2
+        fi
+    fi
+    if [ -z "$keep_stage" ] && [ -n "$STAGE" ] && [ -d "$STAGE" ]; then
+        # A read-only folder inside the previous app would otherwise stop the removal.
+        chmod -R u+w -- "$STAGE" 2>/dev/null || true
+        rm -rf -- "$STAGE" 2>/dev/null || printf 'slipper: could not remove %s\n' "$STAGE" >&2
+    fi
+    if [ -n "$LOCKED" ]; then
+        rm -f -- "$LOCK/owner"
+        rmdir -- "$LOCK" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# One Slipper run per target at a time. Two runs replacing the same app could otherwise move
+# each other's half-built app aside. The lock is a folder beside the target, holding the
+# owner's PID, and the EXIT trap removes it.
+LOCK="$PARENT/.slipper-lock-$(printf '%s' "$APP_FILE" | shasum -a 256 | cut -c1-16)"
+if ! mkdir -- "$LOCK" 2>/dev/null; then
+    owner=$(cat -- "$LOCK/owner" 2>/dev/null || true)
+    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+        die "a Slipper run (PID $owner) stopped without cleaning up. Remove the folder $LOCK and run Slipper again."
+    fi
+    die "another Slipper run is working on $OUTPUT; try again when it finishes"
+fi
+LOCKED=1
+printf '%s\n' "$$" > "$LOCK/owner"
+
+OLD_ID=""
+if [ -L "$OUTPUT" ]; then
+    die "$OUTPUT is a symbolic link; not replacing it"
+elif [ -e "$OUTPUT" ]; then
+    [ -d "$OUTPUT" ] || die "$OUTPUT exists and is not an app"
+    if is_ours "$OUTPUT"; then
+        REPLACE=ours
+        OLD_ID=$(plist_raw "$OUTPUT" "$ID_KEY" || true)
+        # The old app is deleted once the new one is in place, so a Finder-locked file in
+        # it would stop that halfway. Refuse before touching anything instead.
+        locked=$(find "$OUTPUT" \( -flags +uchg,schg \) -print 2>/dev/null | head -n 1)
+        [ -z "$locked" ] ||
+            die "$OUTPUT has locked files (for example $locked). Unlock them in Finder (Get Info > Locked), then run Slipper again."
+    elif [ -n "$FORCE" ]; then
+        REPLACE=foreign
+    else
+        die "$OUTPUT already exists and was not created by Slipper. Use --force to replace it (the old one is kept beside it, renamed)."
+    fi
+fi
+
+# A random ID keys the bundle ID and the launcher's state, so two apps never share them even
+# when their names match. Replacing an app Slipper made keeps its ID.
+case $OLD_ID in
+    [0-9a-f]*-*-*-*-*[0-9a-f]) case $OLD_ID in *[!0-9a-f-]*) OLD_ID="" ;; esac ;;
+    *) OLD_ID="" ;;
+esac
+APP_ID=${OLD_ID:-$(uuidgen | LC_ALL=C tr 'A-Z' 'a-z')}
+case $APP_ID in '' | *[!0-9a-f-]*) die "couldn't make an app ID (uuidgen said: $APP_ID)" ;; esac
+
+# --- Find the templates (works from a clone and from a Homebrew install) ----------------
+
+self=$0
+while [ -L "$self" ]; do
+    case $self in */*) dir=${self%/*} ;; *) dir=. ;; esac
+    link=$(readlink -- "$self")
+    case $link in /*) self=$link ;; *) self="$dir/$link" ;; esac
+done
+case $self in */*) SELF_DIR=${self%/*} ;; *) SELF_DIR=. ;; esac
+TEMPLATES=""
+for candidate in "${SLIPPER_TEMPLATES:-}" "$SELF_DIR/templates" "$SELF_DIR/../share/slipper/templates"; do
+    if [ -n "$candidate" ] && [ -f "$candidate/launcher.command" ] && [ -f "$candidate/open-in-terminal" ]; then
+        TEMPLATES=$candidate
+        break
+    fi
+done
+[ -n "$TEMPLATES" ] || die "can't find templates/launcher.command next to $self"
+
+# --- Build the app in a staging folder beside the target, then move it into place -------
+
+STAGE=$(mktemp -d "$PARENT/.slipper.XXXXXX") || die "can't write to $PARENT"
+
+
+APP="$STAGE/new.app"
+RES="$APP/Contents/Resources"
+mkdir -p -- "$APP/Contents/MacOS" "$RES"
+
+echo "Creating $NAME"
+echo "  App:   $OUTPUT"
+echo "  Port:  $PORT"
+echo "  URL:   $URL"
+
+if [ -n "$ICON" ]; then
+    echo "  Icon:  $ICON"
+    ICONSET="$STAGE/AppIcon.iconset"
+    mkdir -- "$ICONSET"
+    sips -s format png -z 1024 1024 "$ICON" --out "$STAGE/icon-1024.png" >/dev/null 2>&1 &&
+        [ -s "$STAGE/icon-1024.png" ] || die "couldn't read $ICON as an image"
+    for size in 16 32 128 256 512; do
+        double=$((size * 2))
+        sips -z "$size" "$size" "$STAGE/icon-1024.png" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null 2>&1 &&
+            sips -z "$double" "$double" "$STAGE/icon-1024.png" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null 2>&1 ||
+            die "couldn't resize the icon"
+    done
+    iconutil -c icns "$ICONSET" -o "$RES/AppIcon.icns" || die "iconutil couldn't build the icon"
+fi
+
+# The bundle executable: fixed code with only the app's ID filled in.
+EXE="$APP/Contents/MacOS/$EXEC_NAME"
+sed "s/^APP_ID=__APP_ID__\$/APP_ID='$APP_ID'/" "$TEMPLATES/open-in-terminal" > "$EXE"
+grep -q "^APP_ID='$APP_ID'\$" "$EXE" || die "templates/open-in-terminal has no APP_ID line"
+chmod 755 "$EXE"
+
+cp -- "$TEMPLATES/launcher.command" "$RES/launcher.command"
+chmod 755 "$RES/launcher.command"
+
+{
+    printf '# Settings for this app, written by Slipper %s. The launcher reads them on every\n' "$VERSION"
+    printf '# start. Values are single-quoted for the shell; keep the quoting if you edit.\n'
+    printf 'APP_NAME=%s\n' "$(shell_quote "$NAME")"
+    printf 'APP_ID=%s\n' "$(shell_quote "$APP_ID")"
+    printf 'APP_PORT=%s\n' "$(shell_quote "$PORT")"
+    printf 'APP_URL=%s\n' "$(shell_quote "$URL")"
+    printf 'APP_WORKDIR=%s\n' "$(shell_quote "$WORKDIR")"
+    printf 'APP_VENV=%s\n' "$(shell_quote "$VENV")"
+    printf 'APP_INSTALL_CMD=%s\n' "$(shell_quote "$INSTALL_CMD")"
+    printf 'APP_START_CMD=%s\n' "$(shell_quote "$START_CMD")"
+    printf 'APP_WAIT_SECONDS=%s\n' "$(shell_quote "$WAIT")"
+} > "$RES/slipper.conf"
+
+# Info.plist through plutil, which escapes every value.
+PLIST="$APP/Contents/Info.plist"
+plutil -create xml1 "$PLIST"
+plist_set() { plutil -insert "$1" "$2" "$3" "$PLIST"; }
+plist_set CFBundleExecutable -string "$EXEC_NAME"
+plist_set CFBundleIdentifier -string "local.slipper.$APP_ID"
+plist_set CFBundleName -string "$NAME"
+plist_set CFBundleDisplayName -string "$NAME"
+plist_set CFBundlePackageType -string APPL
+plist_set CFBundleInfoDictionaryVersion -string 6.0
+plist_set CFBundleShortVersionString -string 1.0
+plist_set CFBundleVersion -string 1
+if [ -n "$ICON" ]; then plist_set CFBundleIconFile -string AppIcon; fi
+plist_set LSUIElement -bool NO
+plist_set "$MARKER_KEY" -string "$VERSION"
+plist_set "$ID_KEY" -string "$APP_ID"
+plutil -lint "$PLIST" >/dev/null || die "the generated Info.plist did not validate"
+
+# Move any previous app aside, claim the target with mkdir (atomic: it fails if anything,
+# a symlink included, appeared there meanwhile), then move the new contents in. Until that
+# last step lands, the EXIT trap puts the previous app back.
+if [ "$REPLACE" = ours ]; then
+    OLD="$STAGE/previous.app"
+elif [ "$REPLACE" = foreign ]; then
+    stamp=$(date +%Y%m%d-%H%M%S)
+    OLD="$OUTPUT.replaced-$stamp"
+    n=1
+    while [ -e "$OLD" ] || [ -L "$OLD" ]; do
+        n=$((n + 1))
+        OLD="$OUTPUT.replaced-$stamp-$n"
+    done
+fi
+if [ -n "$OLD" ]; then
+    if ! mv -- "$OUTPUT" "$OLD"; then
+        OLD=""
+        die "couldn't move the existing $OUTPUT aside"
+    fi
+fi
+mkdir -- "$OUTPUT" 2>/dev/null || die "$OUTPUT appeared while Slipper was working (another run?); left it alone"
+CREATED=1
+# Into the folder, not onto a path: if a Contents appeared there, the rename fails instead
+# of nesting this one inside it.
+mv -- "$APP/Contents" "$OUTPUT/" || die "couldn't move the new app into $OUTPUT"
+DONE=1
+[ "$REPLACE" != foreign ] || echo "  Kept the old app as $OLD"
+touch -c -- "$OUTPUT"
+
+echo ""
+echo "Created $OUTPUT"
+echo "Open it once from Finder, then keep it in the Dock (drag it there, or right-click"
+echo "its Dock icon and choose Options > Keep in Dock)."
+echo "Settings: $OUTPUT/Contents/Resources/slipper.conf"
